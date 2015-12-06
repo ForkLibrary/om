@@ -1,5 +1,5 @@
 (ns om.next.tests
-  (:require [cljs.test :refer-macros [deftest is testing run-tests]]
+  (:require [cljs.test :refer-macros [deftest is are testing run-tests]]
             [goog.object :as gobj]
             [clojure.zip :as zip]
             [om.next :as om :refer-macros [defui]]
@@ -499,6 +499,29 @@
                     {:id 1, :name "Laura", :friends [{:id 0, :name "Bob"}]}
                     {:id 2, :name "Mary", :friends []}]}))))
 
+(deftest db->tree-graph-loops
+  (let [sam {:db/id 1 :person/name "Sam" :person/mate [:people/by-id 2]}
+        jenny {:db/id 2 :person/name "Jenny" :person/mate [:people/by-id 1]}
+        app-state {:widget/people [[:people/by-id 1] [:people/by-id 2]] :people/by-id {1 sam 2 jenny}}]
+    (is (= {[:people/by-id 1] {:person/name "Sam",
+                               :person/mate {:person/name "Jenny",
+                                             :person/mate [:people/by-id 1]}}}
+           (om/db->tree '[{[:people/by-id 1] [:person/name {:person/mate ...}]}] app-state app-state)))))
+
+(deftest db->tree-unions
+  (let [db {:panels        [[:panelA :ui] [:panelB :ui] [:panelC :ui]]
+            :current-panel [:panelA :ui]
+            :panelA        {:ui {:boo 42}}
+            :panelB        {:ui {:goo 8}}
+            :panelC        {:ui {:sticky true}}}
+        union {:panelC [:sticky], :panelA [:boo], :panelB [:goo]}
+        list-query [{:panels union}]
+        single-query [{:current-panel union}]
+        ident-query [{[:panelC :ui] union}]]
+    (is (= {:panels [{:boo 42} {:goo 8} {:sticky true}]} (om/db->tree list-query db db)))
+    (is (= {:current-panel {:boo 42}} (om/db->tree single-query db db)))
+    (is (= {[:panelC :ui] {:sticky true}} (om/db->tree ident-query db db)))))
+
 ;; -----------------------------------------------------------------------------
 ;; Message Forwarding
 
@@ -693,29 +716,53 @@
   [{:keys [ast] :as env} _ _]
   {:remote (assoc ast :query-root true)})
 
-(deftest test-rewrite
-  (is (= ((om/rewrite {:real/key [:fake/key :real/key]})
-           {:real/key 1})
-         {:fake/key {:real/key 1}})))
+(defmethod precise-read :other/key
+  [{:keys [ast] :as env} _ _]
+  {:remote ast})
+
+(defn precise-mutate [{:keys [ast] :as env} _ _]
+  {:remote true })
 
 (deftest test-query-root
   (let [ast (assoc (parser/expr->ast {:real/key [:id]})
               :query-root true)]
     (is (= (meta (parser/ast->expr ast)) {:query-root true}))))
 
-(deftest test-process-roots
-  (let [p (om/parser {:read precise-read})
-        m (om/process-roots
-            (p {:state (atom {})}
-              [{:fake/key [{:real/key [:id]}]}] :remote))]
-    (is (= [{:real/key [:id]}] (:query m))))
-  (is (= (let [p (om/parser {:read precise-read})]
-           ((:rewrite
-              (om/process-roots
-                (p {:state (atom {})}
-                  [{:fake/key [{:real/key [:id]}]}] :remote)))
-             {:real/key 1}))
-         {:fake/key {:real/key 1}})))
+; process-roots can cause duplicate top-level queries. merge-joins is used to pull them together
+(deftest test-merge-joins-on-non-merges
+  (are [merged raw] (= merged (om/merge-joins raw))
+    ; calls
+    '[(app/f) :a (app/g)] '[(app/f) :a (app/g)]
+    ; plain properties
+    '[:a :b] '[:a :b]
+    ; ident as key
+    [{[:db/id 1] [:a :b]}] [{[:db/id 1] [:a :b]}]
+    ; unions
+    [{:a [:type] :b [:type]}] [{:a [:type] :b [:type]}]
+    [{:j [:a]} {:widget [{:a [:type] :b [:type]}]}] [{:j [:a]} {:widget [{:a [:type] :b [:type]}]}]))
+
+(deftest test-merge-joins-eliminates-exact-duplicates
+  (are [merged raw] (= merged (om/merge-joins raw))
+    [:a] [:a :a]
+    [{:j1 [:a :b]}] [{:j1 [:a :b]} {:j1 [:a :b]}]))
+
+(deftest test-merge-joins-merges-simple-joins
+  (is (= [{:j [:a :b]}] (om/merge-joins [{:j [:a]} {:j [:b]}]))))
+
+(deftest test-merge-joins-eliminates-duplicate-selector-elements
+  (is (= [{:j [:a :b]}] (om/merge-joins [{:j [:a]} {:j [:a :b]}]))))
+
+(deftest test-merge-joins-merges-nested-joins-of-duplicates
+  (is (= [{:j [:b {:a [:x :y]}]}] (om/merge-joins [{:j [{:a [:x]}]} {:j [{:a [:y]} :b]}]))))
+
+(deftest test-merge-joins-retains-property-and-call-order-at-top-level
+  (is (= '[(app/f) :b :d :e {:j [:b {:a [:x :y]}]} {:k [:x {:y [:b]}]} {:c [:ca :cb]} {:l [:m]}]
+         (om/merge-joins '[(app/f) {:j [{:a [:x]}]} :b {:k [:x]}
+                             {:c [:ca :cb]} {:j [{:a [:y]} :b]} :d
+                             {:k [{:y [:b]}]} :e {:l [:m]}]))))
+
+(deftest test-merge-joins-handles-recursive-queries
+  (is (= [{:j '...}] (om/merge-joins [{:j '...} {:j '...}]))))
 
 (deftest test-process-roots-recursive
   (let [p (om/parser {:read precise-read})
@@ -723,6 +770,53 @@
             (p {:state (atom {})}
               '[{:fake/key [{:real/key ...}]}] :remote))]
     (is (= [{:real/key '...}] (:query m)))))
+
+(deftest test-process-roots-keeps-top-rooted-keys
+  (let [p (om/parser {:read precise-read :mutate precise-mutate})
+        m (om/process-roots
+            (p {:state (atom {})}
+               '[:other/key {:fake/key [{:real/key ...}]} {:other/key [:x]}] :remote))]
+    (is (= '[:other/key {:real/key ...} {:other/key [:x]}] (:query m)))))
+
+(deftest test-process-roots-keeps-mutations
+  (let [p (om/parser {:read precise-read :mutate precise-mutate})
+        m (om/process-roots
+            (p {:state (atom {})}
+               '[(app/f) {:fake/key [{:real/key ...}]} (app/g)] :remote))]
+    (is (= '[(app/f) (app/g) {:real/key ...}] (:query m)))))
+
+(let [ref-rooted-join (with-meta {[:db/id 4] [:a :b]} {:query-root true})
+      j1 (with-meta {:j1 [:a :b]} {:query-root true})
+      j2 (with-meta {:j2 [:x {:j3 [:y :z]}]} {:query-root true})
+      sub-rooted-join (with-meta {:subrooted-join [:x j1]} {:query-root true})]
+
+  (let [{:keys [query rewrite]} (om/process-roots [{:top [ref-rooted-join j1]}])]
+    (deftest test-process-roots-promotes-non-sub-rooted-queries
+      (is (= [{[:db/id 4] [:a :b]} {:j1 [:a :b]}] query)))
+
+    (deftest test-rewrite-result-for-promoted-non-sub-rooted-queries
+      (let [top-result {[:db/id 4] {:a 4 :b 5} :j1 {:a 9 :b 10}}
+            expected-rewritten-result {:top {[:db/id 4] {:a 4 :b 5}
+                                             :j1        {:a 9 :b 10}}}]
+        (is (= expected-rewritten-result (rewrite top-result))))))
+
+  (let [{:keys [query rewrite]} (om/process-roots [{:top [j1 sub-rooted-join]}])]
+    (deftest test-process-roots-ignores-subroots
+      (is (= [{:j1 [:a :b]} {:subrooted-join [:x {:j1 [:a :b]}]}] query)))
+
+    (deftest test-rewrite-roots-on-ignored-subroots
+      (let [top-result {:j1 {:a 9 :b 10} :subrooted-join {:x 11 :j1 {:a 9 :b 10}}}
+            expected-rewritten-result {:top {:j1             {:a 9 :b 10}
+                                             :subrooted-join {:x 11 :j1 {:a 9 :b 10}}}}]
+        (is (= expected-rewritten-result (rewrite top-result))))))
+
+  (let [top-result {:j1 {:a 9 :b 10}}
+        expected-rewritten-result '{:top {:j1 {:a 9 :b 10} :j3 {:j1 {:a 9 :b 10}}}}
+        {:keys [query rewrite]} (om/process-roots [{:top [j1 {:j3 [j1]}]}])]
+    (deftest test-process-roots-can-reroot-same-join-from-multiple-paths
+      (is (= [{:j1 [:a :b]}] query)))
+    (deftest test-rewrite-of-same-join-to-multiple-paths
+      (is (= expected-rewritten-result (rewrite top-result))))))
 
 ;; -----------------------------------------------------------------------------
 ;; User Bugs
@@ -850,7 +944,8 @@
 ;; Query Ident Test
 
 (def link-data
-  {:current-user {'_ {:email "bob.smith@gmail.com"}}
+  {:current-user {:email "bob.smith@gmail.com"}
+   :settings {0 {:foo :bar}}
    :items [{:id 0 :title "Foo"}
            {:id 1 :title "Bar"}
            {:id 2 :title "Baz"}]})
@@ -858,9 +953,10 @@
 (defmulti link-read om/dispatch)
 
 (defmethod link-read :items
-  [{:keys [query state]} k _]
+  [{:keys [query state ast]} k _]
   (let [st @state]
-    {:value (om/db->tree query (get st k) st)}))
+    {:value  (om/db->tree query (get st k) st)
+     :remote (update-in ast [:query] #(into [] (remove om/ident?) %))}))
 
 (defui LinkItem
   static om/Ident
@@ -868,7 +964,7 @@
     [:item/by-id id])
   static om/IQuery
   (query [_]
-    '[:id :title [:current-user _]]))
+    '[:id :title [:current-user _] [:settings 0]]))
 
 (defui LinkList
   static om/IQuery
@@ -879,4 +975,7 @@
   (let [parser (om/parser {:read link-read})
         state  (atom (om/tree->db LinkList link-data true))
         ui     (parser {:state state} (om/get-query LinkList))]
-    (is (every? #(contains? % :current-user) (:items ui)))))
+    (is (every? #(contains? % :current-user) (:items ui)))
+    (is (every? #(contains? % [:settings 0]) (:items ui)))
+    (is (= (parser {:state state} (om/get-query LinkList) :remote)
+           [{:items [:id :title]}]))))
